@@ -12,7 +12,7 @@ import numpy as np
 def load_to_db(data):
     try:
         connection = psycopg2.connect(user = "postgres",
-                                    password = "benjamin55",
+                                    password = "password",
                                     host = "127.0.0.1",
                                     port = "5432",
                                     database = "postgres")
