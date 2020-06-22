@@ -98,6 +98,7 @@ merged_location_data.insert(loc=0, column='MLS_num', value=data.MLS_num)
 merged_location_data.subway_dist = merged_location_data.subway_dist.astype('str')
 
 merged_location_data.to_excel("Data\\second_batch_location_data.xlsx")
+
 #load_data = [tuple(x) for x in merged_location_data.values]
 #load_to_db(load_data)
 

@@ -3,10 +3,19 @@ import numpy as np
 import pandas as pd
 import datetime
 import sys
-sys.path.append('\\.')
+sys.path.append('..')
 from ML_functions import find_permutations
+from statsmodels.stats.multitest import multipletests
+from sklearn.decomposition import PCA, KernelPCA
+from sklearn.cross_decomposition import PLSRegression
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from keras.preprocessing.text import Tokenizer, text_to_word_sequence
+from scipy.stats import ttest_ind
 
-data = pd.read_excel("Data\\joined_housing_data.xlsx")
+#multipletests(pvals, alpha=0.05, method='fdr_bh'),
+
+data = pd.read_excel("..\\Data\\Housing\\joined_housing_data.xlsx")
 
 #%% REMOVE OUTLIERS AND DROP DUPLICATES AND USELESS VARIABLES
 data = data[data.sold_price < 0.65e7]
@@ -164,16 +173,12 @@ data.loc[data.neighborhood.isin(['Humberlea', 'Jane & Finch', 'Emery', 'Humber S
 data.loc[data.neighborhood.isin(['Victoria Village']), 'district'] = 'Don Valley East'
 #TODO Still more to map
 
-#Fix other errors
-
-
 #Replace remaining 'Other' categories with correct values TODO: replace this
 data.district = data.district.replace({'Other1': 'Scarborough—Agincourt', 'Other2': 'Toronto—Danforth'})
 
 #For each 'Other#' find the most common value for district for the respective neighborhoood that isn't 'Other#'
 for district in ['Other2', 'Other3', 'Other4', 'Other5', 'Other6', 'Other7']:
     other_df = data[data.district == district]
-    missing = 0
     for neighbor in other_df.neighborhood.values:
         neighbor_district = data.district[data.neighborhood == neighbor]
         most_common_district = neighbor_district[neighbor_district != district].mode()
@@ -181,9 +186,7 @@ for district in ['Other2', 'Other3', 'Other4', 'Other5', 'Other6', 'Other7']:
         if not most_common_district.empty:
             data.loc[condition, 'district'] = most_common_district
         else:
-            missing += 1
             data.loc[condition, 'district'] = 'None'
-    #print('Missing district count for', district, ':', missing)
 del(other_df)
 
 data.district = data.district.fillna('None')
@@ -209,7 +212,74 @@ data.heating_fuel = data.heating_fuel.replace({'Grnd Srce': 'Other',
 data.type = data.type.replace({'Triplex': 'Multiplex', 
                                 'Fourplex': 'Multiplex'})
 
-#%% EXTRACT AND ENGINEER NEW FEATURES
+data.heat_type = data.heat_type.replace({'Fan Coil': 'Other'})
+
+data.heating_fuel = data.heating_fuel.replace({'Wood': 'Other', 
+                                                'Grnd Srce': 'Other'})
+
+
+#%% EXTRACT CATEGORICAL FEATURES
+
+#Tokenize description
+char_filter = '[0123456789!"#$%&()*+,-./:;<=>?@[\\]^_`{|}~\t\n]'
+text_tokenizer = Tokenizer(num_words=2500, filters = filters)
+text_tokenizer.fit_on_texts(data.description)
+
+#Extract pvalues of difference in mean price for words with more than 'min_occurences'
+word_filter = ['and', 'or', 'of', 'to']
+min_occurrences = 50
+fdr_cutoff = 1e-8
+output_list = []
+
+for word, count in text_tokenizer.word_counts.items():
+
+    if count < min_occurrences or word in word_filter:
+        continue
+
+    contains_word = data.description.str.replace(char_filter, '').str.contains('(^| )' + word + '( |$)')
+    n_occurrences = contains_word.sum()
+
+    if n_occurrences > min_occurrences and n_occurrences != len(data):
+        price1, price2 = data.sold_price[contains_word], data.sold_price[~contains_word]
+        price_diff = price1.mean() - price2.mean()
+        pval = ttest_ind(price1, price2).pvalue
+        output_list.append((word, count, n_occurrences, price_diff, pval))
+
+#Find corrected pvals and filter
+df = pd.DataFrame(output_list, columns = ['word', 'count', 'n_occurences', 'price_diff', 'pval'])
+df['corrected_pvals'] = multipletests(df['pval'], alpha=0.05, method='fdr_bh')[1]
+
+#Volcano plot
+#import matplotlib.pyplot as plt
+#plt.scatter(df.price_diff, -np.log10(df.corrected_pvals))
+
+df = df[df.corrected_pvals < fdr_cutoff]
+
+#Add new features to data
+for word in df.word.values:
+    data['desc_' + word] = data.description.str.replace(char_filter, '').str.contains('(^| )' + word + '( |$)') * 1
+
+#Flag for pool
+data['desc_pool'] = ((data.description.str.contains('pool(?! table)(?!-size)(?! size)(?!s)')) & 
+                ~(data.description.str.contains('(close|walk|steps|near|drive|mins|minute|seconds)[^\\.\\!]+pool'))) * 1
+
+#Flag for house being sold for lot value
+data['desc_property_value'] = data.description.str.contains("(builder(?!'s))|(blder(?!'s))|(buildable)|(build your)|(sold as is)") * 1
+data.loc[data.MLS_num.isin(['W4745715']), 'property_value'] = 1
+data.loc[data.MLS_num.isin(['C4677376', 'W4652577']), 'property_value'] = 0
+
+#Create flag for houses that are used for rental purposes and manually fix errors
+data['desc_rental_property'] = (data.description.str.contains('(?<!ac-)(?<!a/c-)(?<!ac )(?<!a/c )(?<!a.c )(?<!a-c )(?<!opport)(?<!comm)(?<!wall)(?<!wall )(?<!end-)(?<!inside-)(?<!end )(?<!inside )unit(?!ed)|rented')) * 1
+data.loc[data.MLS_num.isin(['C4655068', 'W4687581', 'W4646585']), 'rental_property'] = 1
+data.loc[data.MLS_num.isin(['C4735576', 'C4703446', 'W4661973', 'C4644839']), 'rental_property'] = 0
+
+#Identify all column names
+automated_words = ['desc_' + word for word in df.word]
+manual_words = ['desc_pool', 'desc_rental_property', 'desc_property_value']
+description_predictors = automated_words + manual_words
+
+
+#%% EXTRACT NUMERICAL FEATURES
 
 #Extract as many sqft values as possible (only ~250)
 ungrouped_sqft = data.description.str.extractall('(?<!lot )([0-9,]+) sq(?:uare)?\.? ?f(?:oo|ee)?t\.?(?! lot)').reset_index()
@@ -231,16 +301,6 @@ data['region_area'] = data.total_pop / data.pop_density
 #Other parking
 data['parking_other'] = (data.parking - data.garage_spaces).apply(lambda x: 0 if x < 0 else x)
 
-#Flag for renovated in description 
-data['renovated'] = data.description.str.contains('renovated') * 1
-
-#Flag for pool
-data['pool'] = ((data.description.str.contains('pool(?! table)(?!-size)(?! size)(?!s)')) & 
-                ~(data.description.str.contains('(close|walk|steps|near|drive|mins|minute|seconds)[^\\.\\!]+pool'))) * 1
-
-#Flag for hot tub
-data['hot_tub'] = data.description.str.contains('hot[- ]?tub') * 1
-
 #Adjusted n_rooms
 basement_rooms = (~data.basement_details.str.contains('none') * 1) + (data.basement_details.str.contains('and') * 1) #NOTE fix
 bed_bath = data.room_names.str.count('bedroom|master|bathroom')
@@ -251,41 +311,20 @@ data.loc[data.adjusted_n_rooms.isna(), 'adjusted_n_rooms'] = other_rooms.median(
 
 #Estimate sqftage of house
 data['sqft_estimated'] = data.mean_room_size * data.adjusted_n_rooms
+
 data[['sqft_estimated', 'sqft_range']].corr() #Check: 0.82 corr
 
 #Difference between n_rooms and average n_rooms for district
 data['diff_room'] = data.adjusted_n_rooms - data.groupby('district')['adjusted_n_rooms'].transform('mean')
 
-
-#%% HOUSES SOLD FOR PURPOSES OTHER THAN HOMES 
-
-#Flag for house being sold for lot value
-data['property_value'] = data.description.str.contains("(builder(?!'s))|(blder(?!'s))|(buildable)|(build your)|(sold as is)") * 1
-data.loc[data.MLS_num.isin(['W4745715']), 'property_value'] = 1
-data.loc[data.MLS_num.isin(['C4677376', 'W4652577']), 'property_value'] = 0
-
-#Create flag for houses that are used for rental purposes and manually fix errors
-data['rental_property'] = (data.description.str.contains('(?<!ac-)(?<!a/c-)(?<!ac )(?<!a/c )(?<!a.c )(?<!a-c )(?<!opport)(?<!comm)(?<!wall)(?<!wall )(?<!end-)(?<!inside-)(?<!end )(?<!inside )unit(?!ed)|rented')) * 1
-data.loc[data.MLS_num.isin(['C4655068', 'W4687581', 'W4646585']), 'rental_property'] = 1
-data.loc[data.MLS_num.isin(['C4735576', 'C4703446', 'W4661973', 'C4644839']), 'rental_property'] = 0
-
 #Taxes per rental units assuming 1 bath per unit
-data['rental_taxes_per_unit'] = data.rental_property * (data.taxes / data.baths)
+data['rental_taxes_per_unit'] = data.desc_rental_property * (data.taxes / data.baths)
 
 #Taxes per bed
-data['rental_taxes_per_bed'] = data.rental_property * (data.taxes/ (data.beds + (data.beds_other/2))) #Treat 'other' beds as half beds
+data['rental_taxes_per_bed'] = data.desc_rental_property * (data.taxes/ (data.beds + (data.beds_other/2))) #Treat 'other' beds as half beds
 
 #Number of beds per unit using same assumption as above
-data['rental_beds_per_unit'] = data.rental_property * ((data.beds + (data.beds_other/2))/data.baths)
-
-#Custom built homes (generally higher priced)
-data['custom_built'] = data.description.str.contains('(custom (built )?.{,25}(home|house))|(professionally designed)') * 1
-
-#Interaction terms
-data['custom_built_taxes'] = data.custom_built * data.taxes 
-data['property_value_taxes'] = data.property_value * data.taxes
-
-#%% OTHER VARIABLES
+data['rental_beds_per_unit'] = data.desc_rental_property * ((data.beds + (data.beds_other/2))/data.baths)
 
 #Number of floors
 data.loc[data.room_floors.isna(), 'room_floors'] = 'none'
@@ -301,26 +340,7 @@ data['n_floors'] = data['n_floors'] + (has_inbetwn * 0.25) #treat inbtween floor
 #Average rooms per floor
 data['mean_room_floors'] = data['adjusted_n_rooms'] / data['n_floors']
 
-#Flag for properties with large lots in the back
-data['ravine_lot'] = data.description.str.contains('(ravine[- ]?lot)|(ravine home)') * 1
-
-#Replace sparse heat type valules
-data.heat_type = data.heat_type.replace({'Fan Coil': 'Other'})
-
-#Replace sparse heat fuel values
-data.heating_fuel = data.heating_fuel.replace({'Wood': 'Other', 'Grnd Srce': 'Other'})
-
-#Create several flags for included appliances (doesn't really work: severeal houses not showing appliances in extras text)
-laundry = data.laundry_level.notna() * 1
-stove = data.extras.str.contains('stove') * 1
-oven = data.extras.str.contains('oven') * 1
-fridge = data.extras.str.contains('fridge') * 1
-washer = data.extras.str.contains('(?<!dish)(?<!dish )(?<!dish-)(washer)|( dw)') * 1
-dryer = data.extras.str.contains('dryer')
-dwasher = data.extras.str.contains('dish[- ]?washer') * 1
-
-data['appliance_ratio'] = (laundry + stove + oven + fridge + washer + dryer + dwasher) / 7
-data.loc[data.extras.isna(), 'appliance_ratio'] = data.appliance_ratio.mean()
+#%% EXTRACT OTHER FEATURES
 
 #Create flags for certain room types
 data.room_names = data.room_names.fillna('other')
@@ -373,48 +393,46 @@ data.fireplace = (data.fireplace == 'Yes') * 1
 data.central_vac = (data.central_vac == 'Yes') * 1
 
 
-#Define columns and transform
-numeric_predictors = ['parking_other', 'garage_spaces', 'lot_size', 'taxes', 'subway_dist', 'mean_room_size', 
-                      'n_floors', 'adjusted_n_rooms', 'median_income', 'lot_front', 'lot_depth', 'median_age',
-                      'owner_percentage', 'pop_density', 'days_since_covid', 'sqft_estimated', 'sqft_range', 
-                      'baths', 'sqft_calc', 'age', 'diff_room', 'n_rooms', 'region_area', 'rental_taxes_per_unit',
-                      'rental_taxes_per_bed', 'rental_beds_per_unit', 'custom_built_taxes', 'property_value_taxes']
+#%%PCA with sqft variables
+pca = Pipeline(steps = [('impute', SimpleImputer(strategy = 'median')),
+                        ('pca', PCA())])
 
-categorical_predictors = ['district', 'subway_name', 'type', 'driveway', 'garage',  'laundry_level', 
+sqft_predictors = ['n_rooms', 'sqft_range', 'sqft_calc']
+components = pca.fit_transform(data[sqft_predictors])
+
+plt.scatter(data.sold_price, components[:, 0])
+pca.named_steps['pca'].explained_variance_ratio_
+
+#%% Create interaction between district and lot_size and adjusted_n_rooms
+
+for district in data.district.unique():
+    data['ls_' + district] = data.lot_size * (data.district == district)
+    data['rm_' + district] = data.adjusted_n_rooms * (data.district == district)
+
+interaction_variables = [col for col in data.columns if 'ls_' in col or 'rm_' in col]
+#%% Define columns
+
+numeric_predictors = ['parking_other', 'garage_spaces', 'lot_size', 'taxes', 'subway_dist', 'mean_room_size', 
+                      'n_floors', 'adjusted_n_rooms', 'median_income', 'lot_front', 'lot_depth',
+                      'owner_percentage', 'pop_density', 'sqft_estimated', 'sqft_range', 
+                      'age', 'diff_room', 'n_rooms', 'region_area', 'rental_taxes_per_unit',
+                      'rental_taxes_per_bed', 'rental_beds_per_unit'] + interaction_variables
+
+categorical_predictors = ['district', 'subway_name', 'type', 'driveway', 'garage', 'laundry_level', 
                           'AC_type', 'heating_fuel', 'levels']
 
-binary_predictors = ['fireplace', 'central_vac', 'pool', 'renovated', 'rental_property', 'property_value', 
-                     'ravine_lot', 'custom_built'] + exterior_predictors + basement_predictors + room_predictors
+binary_predictors = ['fireplace', 'central_vac'] + description_predictors + exterior_predictors + basement_predictors + room_predictors
 
 data[binary_predictors] = data[binary_predictors].astype(int)
 
 #Delete placeholder variables crowding variables viewer
 del(contains_acres, contains_feet, contains_metre, metre_series, acre_series, feet_series, sqm_to_sqft)
-del(washer, dryer, laundry, stove, oven, dwasher, fridge)
 del(has_inbetwn, floors)
-del(neighbor, neighbor_district, most_common_district, district, condition, missing)
+del(neighbor, neighbor_district, most_common_district, district, condition)
 del(basement_rooms, bed_bath, other_rooms, exterior_values, basement_values)
 del(exterior_predictors, basement_predictors, room_predictors)
 del(ungrouped_sqft, sqft_series)
 
 
-#data['room_other'] = data[room_predictors].apply(lambda x: (x == 0).all(), axis = 1) * 1
-
-#%%
-###Get second order and interactions of top n
-n = 8
-higher_order_predictors = data.drop('list_price', axis = 1).corr()['sold_price'].sort_values().tail(n + 1).drop('sold_price').index
-
-accumulated_predictors = []
-for predictor in higher_order_predictors:
-    #Squared terms
-    data[predictor + '_^2'] = np.square(data[predictor])
-    numeric_predictors.append(predictor + '_^2')
-    accumulated_predictors.append(predictor)
-    
-    for other_predictor in higher_order_predictors.drop(accumulated_predictors):
-        #Interaction terms
-        data[predictor + '_' + other_predictor] = data[predictor] * data[other_predictor]
-        numeric_predictors.append(predictor + '_' + other_predictor)
 
 # %%
